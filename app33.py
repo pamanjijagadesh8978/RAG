@@ -168,7 +168,7 @@ def semantic_search(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
 @st.cache_resource(show_spinner=False)
 def get_ddg_wrapper():
     logging.info("Initializing DuckDuckGoSearchAPIWrapper (cached).")
-    return DuckDuckGoSearchAPIWrapper(max_results=50)
+    return DuckDuckGoSearchAPIWrapper(max_results=15)
 
 wrapper = get_ddg_wrapper()
 
@@ -575,4 +575,5 @@ if query:
 - **Total tokens:** {st.session_state.total_tokens}
 """
     )
+
 # ==================== END OF FILE ====================

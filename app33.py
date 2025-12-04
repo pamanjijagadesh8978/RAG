@@ -27,8 +27,8 @@ logging.info("Starting application initialization.")
 
 load_dotenv()
 
-MISTRAL_ENDPOINT = os.getenv("MISTRAL_ENDPOINT")
-MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
+MISTRAL_ENDPOINT = "https://mistral-small-2503-Pamanji-test.southcentralus.models.ai.azure.com"
+MISTRAL_API_KEY = "5SKKbylMh5ueyeSfvUre68vknfYZMVAr"
 
 if not MISTRAL_API_KEY or not MISTRAL_ENDPOINT:
     # Use st.error instead of raising EnvironmentError to allow Streamlit UI to display the error
@@ -577,3 +577,4 @@ if query:
     )
 
 # ==================== END OF FILE ====================
+

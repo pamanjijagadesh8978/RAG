@@ -1,0 +1,17 @@
+numpy
+streamlit
+pandas
+langchain
+openpyxl
+langgraph
+ddgs
+langchain
+langchain-core
+langchain-community
+langchain-mistralai
+langgraph
+duckduckgo-search
+ddgs
+streamlit
+sentence-transformers
+scikit-learn

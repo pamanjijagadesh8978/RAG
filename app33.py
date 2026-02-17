@@ -10,9 +10,8 @@ import pandas as pd
 import torch
 from sentence_transformers import SentenceTransformer, util
 import pickle
-import time
+
 # LangChain / LangGraph Imports
-# Added AIMessage import for cleaner error handling in call_llm
 from langchain_core.messages import SystemMessage, BaseMessage, HumanMessage, ToolMessage, AIMessage
 from langchain_mistralai import ChatMistralAI
 from langchain_core.tools import tool
@@ -21,25 +20,43 @@ from langgraph.graph import StateGraph, END
 from langchain_community.callbacks import get_openai_callback
 
 # ==================== CONFIGURATION ====================
-# Initialize logging configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logging.info("Starting application initialization.")
 
 load_dotenv()
 
-MISTRAL_ENDPOINT = "https://mistral-small-2503-Pamanji-test.southcentralus.models.ai.azure.com"
-MISTRAL_API_KEY = "5SKKbylMh5ueyeSfvUre68vknfYZMVAr"
+# ==================== STREAMLIT PAGE CONFIG (do early) ====================
+st.set_page_config(page_title="Nutrition Assistant", page_icon="🥗")
+
+# ==================== STREAMLIT SIDEBAR: KEY/ENDPOINT INPUT ====================
+if "mistral_endpoint" not in st.session_state:
+    st.session_state["mistral_endpoint"] = ""
+if "mistral_api_key" not in st.session_state:
+    st.session_state["mistral_api_key"] = ""
+
+with st.sidebar:
+    st.header("🔐 Mistral Connection")
+    st.session_state["mistral_endpoint"] = st.text_input(
+        "Mistral Endpoint",
+        value=st.session_state["mistral_endpoint"],
+        placeholder="https://<your-endpoint>.models.ai.azure.com",
+    ).strip()
+
+    st.session_state["mistral_api_key"] = st.text_input(
+        "Mistral API Key",
+        value=st.session_state["mistral_api_key"],
+        type="password",
+        placeholder="Paste your API key",
+    ).strip()
+
+MISTRAL_ENDPOINT = st.session_state["mistral_endpoint"]
+MISTRAL_API_KEY = st.session_state["mistral_api_key"]
 
 if not MISTRAL_API_KEY or not MISTRAL_ENDPOINT:
-    # Use st.error instead of raising EnvironmentError to allow Streamlit UI to display the error
-    logging.error("Missing MISTRAL_API_KEY or MISTRAL_ENDPOINT. Stopping.")
-    st.error("Missing required environment variables: MISTRAL_API_KEY or MISTRAL_ENDPOINT.")
-    st.stop()
-logging.info("Environment variables loaded.")
-
+    st.sidebar.warning("Enter **Mistral Endpoint** and **API Key** to enable the assistant.")
+logging.info("Mistral settings read from Streamlit UI (if provided).")
 
 # ==================== LOAD NUTRITION DATA ====================
-# Make sure FNDDS.csv is present in the same folder
 try:
     df = pd.read_csv("FNDDS.csv")
     logging.info(f"Loaded FNDDS.csv successfully with {len(df)} rows.")
@@ -55,7 +72,6 @@ except Exception as e:
 # Normalize description column name (defensive)
 try:
     if "Main food description" not in df.columns:
-        # attempt common alternatives or error
         possible = [c for c in df.columns if "food" in c.lower() or "description" in c.lower()]
         if possible:
             df.rename(columns={possible[0]: "Main food description"}, inplace=True)
@@ -97,7 +113,6 @@ cols = df.columns.tolist()
 @st.cache_resource(show_spinner=False)
 def load_sentence_model(name: str = MODEL_NAME) -> SentenceTransformer:
     logging.info(f"Loading SentenceTransformer model: {name} (CPU)")
-    # SentenceTransformer accepts device parameter internally; set to CPU explicitly
     model = SentenceTransformer(name, device="cpu")
     logging.info("SentenceTransformer loaded.")
     return model
@@ -109,9 +124,8 @@ def load_embeddings(embed_file: str = EMBED_FILE):
         saved = pickle.load(f)
 
     sentences = saved["sentences"]
-    embeddings_raw = saved["embeddings"]  # likely a numpy array or list
+    embeddings_raw = saved["embeddings"]
 
-    # Convert to torch tensor (CPU) and normalize
     emb_tensor = torch.tensor(embeddings_raw, dtype=torch.float32)
     emb_tensor = torch.nn.functional.normalize(emb_tensor, p=2, dim=1)
     logging.info(f"Embeddings loaded and normalized: shape={tuple(emb_tensor.shape)}")
@@ -121,33 +135,24 @@ model = load_sentence_model()
 sentences, corpus_embeddings = load_embeddings()
 
 # ==================== FAST SEMANTIC SEARCH (CPU, no FAISS) ====================
-# We'll cache recent queries using st.cache_data (simple caching)
 @st.cache_data(show_spinner=False)
 def semantic_search_cached(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
     return semantic_search_impl(query, top_k=top_k)
 
 def semantic_search_impl(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-    """
-    Compute a query embedding (normalized) and perform fast dot-product with pre-normalized corpus.
-    Returns top_k matches as a list of dicts: {row_number, match, score}
-    """
     logging.info(f"semantic_search: embedding and searching for query='{query}' (top_k={top_k})")
-    # encode with convert_to_tensor and normalize via parameter if available
     try:
         q_emb = model.encode(query, convert_to_tensor=True, normalize_embeddings=True)
     except TypeError:
-        # older versions: compute and normalize manually
         q_emb = model.encode(query, convert_to_tensor=True)
         q_emb = torch.nn.functional.normalize(q_emb, p=2, dim=0)
 
-    # Ensure q_emb is CPU tensor float32
     if isinstance(q_emb, torch.Tensor):
         q_emb = q_emb.cpu().float()
     else:
         q_emb = torch.tensor(q_emb, dtype=torch.float32)
 
-    # Dot product between corpus_embeddings (N x D) and q_emb (D,)
-    scores = torch.mv(corpus_embeddings, q_emb)  # faster than matmul for vector multiply
+    scores = torch.mv(corpus_embeddings, q_emb)
     top_k = min(top_k, scores.size(0))
     top_values, top_indices = torch.topk(scores, k=top_k)
 
@@ -204,19 +209,17 @@ You are a tool-dependent nutrition assistant. Do NOT answer from your own knowle
 
 6. Only answer nutrition/health-related questions; refuse others.
 """
+
 # ==================== TOOLS ====================
 @tool
 async def search_web(query: str) -> str:
-    """Run DuckDuckGo search asynchronously and return text results."""
     logging.info(f"Tool: search_web called with query: '{query}'")
     try:
         loop = asyncio.get_event_loop()
-        # run the blocking wrapper.run in an executor
         results = await loop.run_in_executor(None, wrapper.run, query)
         if not results:
             logging.warning("Tool: search_web returned no results.")
             return "No search results available."
-        # wrapper.run typically returns a string or structured text; normalize to string
         logging.info("Tool: search_web succeeded.")
         return str(results)
     except Exception as exc:
@@ -225,19 +228,14 @@ async def search_web(query: str) -> str:
 
 @tool
 async def get_matching_food(keyword: str) -> Any:
-    """
-    Return rows of nutritional information that match a given food name.
-    """
     logging.info(f"Tool: get_matching_food called with keyword: '{keyword}'")
 
-    # Split "food, col1, col2"
     parts = [p.strip() for p in keyword.split(",")]
     keyword = parts[0]
-    col_names = parts[1:]  # optional user columns
+    col_names = parts[1:]
     matched_cols = []
 
     try:
-        # Normalize keyword
         if not isinstance(keyword, str):
             keyword = str(keyword)
         key = keyword.strip().lower()
@@ -246,38 +244,25 @@ async def get_matching_food(keyword: str) -> Any:
             logging.warning("Tool: get_matching_food received an empty keyword.")
             return "No keyword provided."
 
-        # Perform semantic search
         results = semantic_search(keyword, top_k=5)
         row_numbers = [r["row_number"] for r in results]
 
-        # If only the food name was provided → return full rows
         if not col_names:
             matched = df.loc[row_numbers]
         else:
-            # Add fixed essential columns
             fixed_cols = ['Main food description', 'Portion weight (g)', 'Portion description']
             col_names = list(set(fixed_cols + col_names))
-            print(f"\nRequested columns: {col_names}")
 
-            # Validate column names exist
             for name in col_names:
                 for col in cols:
                     if name.lower() in col.lower():
                         matched_cols.append(col)
-                        break   # stop after first match
-            print(f"\nRequested columns: {matched_cols}")
+                        break
 
             if not matched_cols:
-                return f"No valid columns found among: {matched_cols}"
+                return f"No valid columns found among: {col_names}"
 
             matched = df.loc[row_numbers, matched_cols]
-
-        print("\nMatched DataFrame rows:")
-        print(matched)
-
-        print("\nTop matches:")
-        for r in results:
-            print(f"[Row {r['row_number']}] {r['score']:.4f} → {r['match']}")
 
         if matched.empty:
             logging.info("Tool: get_matching_food found no matching rows.")
@@ -288,60 +273,54 @@ async def get_matching_food(keyword: str) -> Any:
 
     except Exception as exc:
         logging.error(f"Tool: get_matching_food failed: {exc}")
-        return f"Food lookup failed: {exc}"        
+        return f"Food lookup failed: {exc}"
 
-# ==================== LLM INIT ====================
-try:
-    llm = ChatMistralAI(
-        endpoint=MISTRAL_ENDPOINT,
-        mistral_api_key=MISTRAL_API_KEY,
+# ==================== LLM INIT (lazy + cached) ====================
+@st.cache_resource(show_spinner=False)
+def get_llm(endpoint: str, api_key: str) -> ChatMistralAI:
+    return ChatMistralAI(
+        endpoint=endpoint,
+        mistral_api_key=api_key,
         temperature=0.2,
     )
-    logging.info("ChatMistralAI initialized.")
-except Exception as e:
-    logging.error(f"Failed to initialize ChatMistralAI: {e}. Stopping.")
-    st.error(f"Failed to initialize ChatMistralAI: {e}")
-    st.stop()
 
-# bind tools to the LLM parent
-parent = llm.bind_tools([search_web, get_matching_food])
+llm = None
+parent = None
+if MISTRAL_ENDPOINT and MISTRAL_API_KEY:
+    try:
+        llm = get_llm(MISTRAL_ENDPOINT, MISTRAL_API_KEY)
+        logging.info("ChatMistralAI initialized from Streamlit inputs.")
+        parent = llm.bind_tools([search_web, get_matching_food])
+    except Exception as e:
+        logging.error(f"Failed to initialize ChatMistralAI: {e}")
+        st.sidebar.error(f"Failed to initialize LLM: {e}")
+        llm = None
+        parent = None
 
 # ==================== WORKFLOW NODES ====================
-# Make call_llm async so we can use await parent.ainvoke(...)
 async def call_llm(state: AgentState) -> AgentState:
-    """
-    Send messages to the LLM and return a new state containing the LLM response
-    and token usage (if available).
-    """
+    if parent is None:
+        msg = "Mistral Endpoint / API Key not set. Please enter them in the sidebar."
+        logging.warning(msg)
+        return {"messages": [AIMessage(content=msg)], "token_usage": None}
+
     messages = [SystemMessage(content=SYSTEM_INSTRUCTION)] + list(state["messages"])
     logging.info(f"LLM Node: Invoking LLM with {len(messages)} messages (including System Instruction).")
 
-    # use parent.ainvoke (async)
     try:
         with get_openai_callback() as cb:
             response = parent.invoke(messages)
             logging.info("LLM Node: Received response from LLM.")
     except Exception as exc:
         logging.error(f"LLM Node: LLM call failed with exception: {exc}")
-        # return a friendly error message embedded as assistant text
         err_msg = f"LLM call failed: {exc}"
-        # FIX: Changed HumanMessage to AIMessage. LLM error response should be an AIMessage.
         return {"messages": [AIMessage(content=err_msg)], "token_usage": None}
-    
+
     if getattr(response, "tool_calls", None):
         logging.info(f"LLM Node: LLM decided to call {len(response.tool_calls)} tool(s).")
     else:
         logging.info("LLM Node: LLM produced a final answer.")
 
-    # Return the model response as a message
-    if isinstance(response, str):
-        # This case is highly unlikely for LangChain LLM output, but retained for robustness.
-        # Should ideally be wrapped as an AIMessage if it came from the LLM.
-        msg = AIMessage(content=response)
-    else:
-        # If the response is a BaseMessage (expected), use it directly
-        msg = response
-    
     return {
         "messages": [response],
         "token_usage": {
@@ -351,77 +330,55 @@ async def call_llm(state: AgentState) -> AgentState:
         },
     }
 
-# tool execution node — already async
 async def take_action(state: AgentState) -> AgentState:
-    """
-    Executes the tools requested by the last LLM message's `tool_calls` attribute.
-    Correctly extracts the single string argument from the kwargs dictionary.
-    """
     last = state["messages"][-1]
     tool_calls = getattr(last, "tool_calls", None) or []
 
     if not tool_calls:
-        # nothing to do
         return {"messages": [], "token_usage": None}
 
     logging.info(f"Tool Executor Node: Executing {len(tool_calls)} tool call(s).")
 
-    # map of tool name -> function
     tool_map = {
         "search_web": search_web,
         "get_matching_food": get_matching_food,
     }
 
     tasks = []
-    # build tasks using the correct tool function
     for t in tool_calls:
         name = t.get("name")
-        args = t.get("args", {})  # Expect a dictionary of kwargs, default to empty dict
+        args = t.get("args", {})
         tool_fn = tool_map.get(name)
 
         if tool_fn is None:
             logging.error(f"Tool Executor Node: Unknown tool '{name}'. Skipping.")
-            # unknown tool — return a ToolMessage saying so
             tasks.append(asyncio.sleep(0, result=f"Unknown tool: {name}"))
             continue
 
-        arg_to_pass = "" 
+        arg_to_pass = ""
 
-        # CRITICAL FIX: LangChain models return arguments as a dictionary (kwargs).
-        # Since the tool functions expect a single positional string argument, we must extract the value.
         if isinstance(args, dict):
             if name == "search_web":
-                # Expects 'query' key
-                arg_to_pass = args.get('query', '')
+                arg_to_pass = args.get("query", "")
             elif name == "get_matching_food":
-                # Expects 'keyword' key
-                arg_to_pass = args.get('keyword', '')
-        # Fallback for old/non-standard LLM tool call formats (e.g., raw string/list if not a dict)
+                arg_to_pass = args.get("keyword", "")
         elif isinstance(args, (list, tuple)):
-             # Join list/tuple items into a single string
-             arg_to_pass = " ".join(map(str, args))
+            arg_to_pass = " ".join(map(str, args))
         else:
-             # Assume raw string argument
-             arg_to_pass = str(args)
-             
-        logging.info(f"Tool Executor Node: Preparing to call tool '{name}' with argument: '{arg_to_pass}'")
+            arg_to_pass = str(args)
 
-        # Call the tool function with the extracted positional argument value
+        logging.info(f"Tool Executor Node: Calling tool '{name}' with argument: '{arg_to_pass}'")
         tasks.append(tool_fn.ainvoke(arg_to_pass))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    logging.info("Tool Executor Node: Tool execution complete. Processing results.")
 
     tool_messages = []
     for t, result in zip(tool_calls, results):
-        # Convert exceptions to strings
         if isinstance(result, Exception):
             content = f"Tool '{t.get('name')}' failed: {result}"
-            logging.error(f"Tool Executor Node: Tool '{t.get('name')}' failed: {result}")
+            logging.error(content)
         else:
             content = result
-            logging.info(f"Tool Executor Node: Tool '{t.get('name')}' succeeded. Result size: {len(str(result))} chars.")
-        # Create a ToolMessage that references tool name & id
         tool_messages.append(
             ToolMessage(tool_call_id=t.get("id", "unknown"), name=t.get("name", "unknown"), content=str(content))
         )
@@ -429,19 +386,15 @@ async def take_action(state: AgentState) -> AgentState:
     return {"messages": tool_messages, "token_usage": None}
 
 # ==================== GRAPH ====================
-# Use StateGraph similarly to your original but we're compiling a graph that uses async functions
 graph = StateGraph(AgentState)
 graph.add_node("llm", call_llm)
 graph.add_node("tool_executor", take_action)
-# conditional function same as before
+
 def should_continue(state: AgentState) -> str:
     last = state["messages"][-1]
-    
-    # Log the decision process
     if getattr(last, "tool_calls", None):
         logging.info("Graph Decision: Tool calls detected. Routing to 'tool_executor'.")
         return "tool_executor"
-    
     logging.info("Graph Decision: No tool calls. Routing to 'END'.")
     return END
 
@@ -450,7 +403,6 @@ graph.add_edge("tool_executor", "llm")
 graph.set_entry_point("llm")
 assistant_agent = graph.compile()
 logging.info("LangGraph agent compiled and ready.")
-
 
 # ==================== EXECUTION WRAPPER ====================
 async def run_agent(query: str) -> tuple[str, dict]:
@@ -463,28 +415,22 @@ async def run_agent(query: str) -> tuple[str, dict]:
     async for step in assistant_agent.astream(initial):
         node, state = list(step.items())[0]
 
-        # Update usage if present
         current_usage = state.get("token_usage", None)
         if current_usage:
-            # We track the last known usage for the final message
             usage = current_usage
 
-        logging.info(f"Agent Execution: Completed node '{node}'. Next decision...")
+        logging.info(f"Agent Execution: Completed node '{node}'.")
 
-        # If we reached END node or the llm node decided to end, extract content
         if node == END or (node == "llm" and should_continue(state) == END):
             final_msg = state["messages"][-1]
-            # Ensure content is extracted robustly
             final_content = getattr(final_msg, "content", str(final_msg))
             logging.info("Agent Execution: Reached END. Final content extracted.")
-            break # Exit loop once final message is found
+            break
 
     logging.info(f"Agent Execution finished. Final usage: {usage}")
     return final_content, usage
 
 # ==================== STREAMLIT UI ====================
-st.set_page_config(page_title="Nutrition Assistant", page_icon="🥗")
-
 st.markdown(
     """
 <div style="padding:20px;border-radius:15px;background:#F0FFF0;border:1px solid #DFF0D8;text-align:center;">
@@ -495,7 +441,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Init session variables
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -504,12 +449,10 @@ if "total_tokens" not in st.session_state:
     st.session_state.total_prompt = 0
     st.session_state.total_completion = 0
 
-# Display history
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.write(msg["content"])
 
-# User input
 query = st.chat_input("Ask something related to Nutritional information...")
 start_time = time.time()
 
@@ -523,27 +466,19 @@ if query:
 
     with st.chat_message("assistant"):
         with st.spinner("🔍 Searching and analyzing..."):
-            # Console feedback that the agent run is starting
-            print(f"\n--- Starting Agent Run for User Query: {query} ---")
-            
-            # Run the agent asynchronously using a fresh loop 
             loop = asyncio.new_event_loop()
             try:
-                # Set event loop for run_agent
                 asyncio.set_event_loop(loop)
                 response, usage_data = loop.run_until_complete(run_agent(query))
                 if usage_data:
-                    usage = usage_data # Assign the usage data if available
+                    usage = usage_data
             except Exception as e:
                 response = f"An error occurred during agent execution: {e}"
-                print(f"--- Agent Run Error: {e} ---")
             finally:
-                # Always ensure the loop is closed to prevent resource leakage
                 try:
                     loop.close()
                 except Exception:
                     pass
-            print("--- Agent Run Finished ---")
 
         end_time = time.time()
         total_time = end_time - start_time
@@ -551,30 +486,26 @@ if query:
         st.write(response)
         st.info(f"⏱️ Time taken: {total_time:.3f} seconds")
 
-    # Save response and token usage into session (if available)
     st.session_state.messages.append({"role": "assistant", "content": response})
-    
+
     st.session_state.total_prompt += usage.get("prompt_tokens", 0)
     st.session_state.total_completion += usage.get("completion_tokens", 0)
     st.session_state.total_tokens += usage.get("total_tokens", 0)
 
-    # ====================== TOKEN METER ======================
-    st.sidebar.title("📊 Token Usage")
-    st.sidebar.info(
-        f"""
+# Token meter (always visible in sidebar)
+st.sidebar.title("📊 Token Usage")
+st.sidebar.info(
+    f"""
 ### 🔹 This response
-- **Prompt tokens:** {usage.get("prompt_tokens", 0)}
-- **Completion tokens:** {usage.get("completion_tokens", 0)}
-- **Total tokens:** {usage.get("total_tokens", 0)}
+- **Prompt tokens:** {usage.get("prompt_tokens", 0) if 'usage' in locals() else 0}
+- **Completion tokens:** {usage.get("completion_tokens", 0) if 'usage' in locals() else 0}
+- **Total tokens:** {usage.get("total_tokens", 0) if 'usage' in locals() else 0}
 
 ---
 
 ### 🔸 Session totals
-- **Prompt tokens:** {st.session_state.total_prompt}
-- **Completion tokens:** {st.session_state.total_completion}
-- **Total tokens:** {st.session_state.total_tokens}
+- **Prompt tokens:** {st.session_state.get("total_prompt", 0)}
+- **Completion tokens:** {st.session_state.get("total_completion", 0)}
+- **Total tokens:** {st.session_state.get("total_tokens", 0)}
 """
-    )
-
-# ==================== END OF FILE ====================
-
+)

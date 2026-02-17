@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 import streamlit as st
 import pandas as pd
 import torch
-from sentence_transformers import SentenceTransformer, util
+from sentence_transformers import SentenceTransformer
 import pickle
 
 # LangChain / LangGraph Imports
@@ -20,7 +20,7 @@ from langgraph.graph import StateGraph, END
 from langchain_community.callbacks import get_openai_callback
 
 # ==================== CONFIGURATION ====================
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logging.info("Starting application initialization.")
 
 load_dotenv()
@@ -213,6 +213,7 @@ You are a tool-dependent nutrition assistant. Do NOT answer from your own knowle
 # ==================== TOOLS ====================
 @tool
 async def search_web(query: str) -> str:
+    """Search the web (DuckDuckGo) for nutrition/health information and return text results."""
     logging.info(f"Tool: search_web called with query: '{query}'")
     try:
         loop = asyncio.get_event_loop()
@@ -228,6 +229,7 @@ async def search_web(query: str) -> str:
 
 @tool
 async def get_matching_food(keyword: str) -> Any:
+    """Look up a food in the USDA FNDDS dataset using semantic search and return matching nutrition rows."""
     logging.info(f"Tool: get_matching_food called with keyword: '{keyword}'")
 
     parts = [p.strip() for p in keyword.split(",")]
@@ -250,7 +252,7 @@ async def get_matching_food(keyword: str) -> Any:
         if not col_names:
             matched = df.loc[row_numbers]
         else:
-            fixed_cols = ['Main food description', 'Portion weight (g)', 'Portion description']
+            fixed_cols = ["Main food description", "Portion weight (g)", "Portion description"]
             col_names = list(set(fixed_cols + col_names))
 
             for name in col_names:
@@ -309,7 +311,7 @@ async def call_llm(state: AgentState) -> AgentState:
 
     try:
         with get_openai_callback() as cb:
-            response = parent.invoke(messages)
+            response = parent.invoke(messages)  # keep sync call, since your original used invoke()
             logging.info("LLM Node: Received response from LLM.")
     except Exception as exc:
         logging.error(f"LLM Node: LLM call failed with exception: {exc}")
@@ -456,13 +458,15 @@ for msg in st.session_state.messages:
 query = st.chat_input("Ask something related to Nutritional information...")
 start_time = time.time()
 
+# Default usage so sidebar token meter always has values
+usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
 if query:
     st.session_state.messages.append({"role": "user", "content": query})
     with st.chat_message("user"):
         st.write(query)
 
     response = ""
-    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
     with st.chat_message("assistant"):
         with st.spinner("🔍 Searching and analyzing..."):
@@ -497,9 +501,9 @@ st.sidebar.title("📊 Token Usage")
 st.sidebar.info(
     f"""
 ### 🔹 This response
-- **Prompt tokens:** {usage.get("prompt_tokens", 0) if 'usage' in locals() else 0}
-- **Completion tokens:** {usage.get("completion_tokens", 0) if 'usage' in locals() else 0}
-- **Total tokens:** {usage.get("total_tokens", 0) if 'usage' in locals() else 0}
+- **Prompt tokens:** {usage.get("prompt_tokens", 0)}
+- **Completion tokens:** {usage.get("completion_tokens", 0)}
+- **Total tokens:** {usage.get("total_tokens", 0)}
 
 ---
 
